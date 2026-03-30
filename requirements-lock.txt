@@ -1,0 +1,46 @@
+# Generated from: pip freeze
+# Python 3.13, macOS
+# To install: pip install -r requirements-lock.txt
+
+certifi==2026.2.25
+charset-normalizer==3.4.6
+click==8.3.1
+dlt==1.24.0
+duckdb==1.5.1
+fsspec==2026.2.0
+gitdb==4.0.12
+GitPython==3.1.46
+giturlparse==0.14.0
+humanize==4.15.0
+idna==3.11
+jsonpath-ng==1.7.0
+markdown-it-py==4.0.0
+mdurl==0.1.2
+numpy==2.4.3
+orjson==3.11.7
+packaging==26.0
+pandas==3.0.1
+pathvalidate==3.3.1
+pendulum==3.2.0
+pluggy==1.6.0
+ply==3.11
+Pygments==2.19.2
+python-dateutil==2.9.0.post0
+pytz==2026.1.post1
+PyYAML==6.0.3
+requests==2.33.0
+requirements-parser==0.13.0
+rich==14.3.3
+rich-argparse==1.7.2
+semver==3.0.4
+setuptools==82.0.1
+simplejson==3.20.2
+six==1.17.0
+smmap==5.0.3
+sqlglot==30.0.3
+stripe==15.0.0
+tenacity==9.1.4
+tomlkit==0.14.0
+typing_extensions==4.15.0
+tzdata==2025.3
+urllib3==2.6.3

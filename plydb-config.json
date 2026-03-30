@@ -1,0 +1,17 @@
+{
+  "databases": {
+    "stripe_analytics": {
+      "metadata": {
+        "name": "Stripe Analytics",
+        "description": "Stripe data loaded via dlt pipeline into DuckDB."
+      },
+      "type": "duckdb",
+      "path": "data/stripe_analytics.db"
+    }
+  },
+  "semantic_context": {
+    "overlays": [
+      "plydb-overlay.yaml"
+    ]
+  }
+}

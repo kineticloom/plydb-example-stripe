@@ -1,0 +1,712 @@
+version: "1.0"
+
+semantic_model:
+  - name: Stripe Analytics Overlay
+    description: Semantic enrichment for Stripe data loaded via dlt pipeline into DuckDB.
+    ai_context:
+      instructions: |
+        IMPORTANT encoding conventions from dlt's Stripe pipeline:
+        - All monetary amounts (amount, unit_amount, fee, net, plan__amount, etc.) are in CENTS (integer).
+          Divide by 100 to get dollars.
+        - All timestamps (created, start_date, current_period_start, current_period_end,
+          canceled_at, ended_at, period_start, period_end, available_on, etc.) are UNIX epoch
+          integers (seconds since 1970-01-01). Use to_timestamp() to convert.
+        - dlt flattens nested Stripe JSON objects using double-underscore (__) as separator.
+          E.g., recurring__interval is the billing interval from the nested "recurring" object.
+        - Child tables (subscription__items__data, invoice__lines__data, etc.) are linked to
+          their parent via _dlt_parent_id = parent._dlt_id (dlt internal surrogate key).
+        - The subscription table denormalizes plan data into plan__* columns (plan__id,
+          plan__amount, plan__interval, plan__product), which duplicate price-level data.
+
+    datasets:
+      - name: stripe_analytics.stripe_updated.customer
+        source: stripe_analytics.stripe_updated.customer
+        description: Stripe customers. Each row is a unique customer account.
+        primary_key: [id]
+        unique_keys:
+          - [id]
+          - [email]
+        fields:
+          - name: id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: id
+            description: Stripe customer ID (prefix cus_).
+          - name: email
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: email
+            description: Customer email address. May be null for programmatically created customers.
+          - name: name
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: name
+            description: Customer display name.
+          - name: currency
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: currency
+            description: Customer's default currency (e.g. "usd"). All customers here use USD.
+          - name: delinquent
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: delinquent
+            description: True if the customer has a past-due invoice.
+          - name: created
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: created
+            description: Unix timestamp when the customer was created.
+            dimension:
+              is_time: true
+
+      - name: stripe_analytics.stripe_updated.product
+        source: stripe_analytics.stripe_updated.product
+        description: Stripe products representing subscription plans and one-off offerings.
+        primary_key: [id]
+        unique_keys:
+          - [id]
+        fields:
+          - name: id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: id
+            description: Stripe product ID (prefix prod_).
+          - name: name
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: name
+            description: Product name.
+          - name: active
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: active
+            description: Whether the product is currently available for purchase.
+          - name: type
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: type
+            description: Product type. Typically "service" for SaaS/subscription products.
+          - name: default_price
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: default_price
+            description: FK to price.id — the default price used when subscribing to this product.
+
+      - name: stripe_analytics.stripe_updated.price
+        source: stripe_analytics.stripe_updated.price
+        description: Stripe prices defining billing amounts and intervals for products. Each product can have multiple prices (e.g. monthly vs annual, or legacy vs current).
+        primary_key: [id]
+        unique_keys:
+          - [id]
+        fields:
+          - name: id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: id
+            description: Stripe price ID (prefix price_).
+          - name: unit_amount
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: unit_amount
+            description: Price amount in CENTS. Divide by 100 for dollars.
+          - name: currency
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: currency
+            description: Currency code (e.g. "usd").
+          - name: type
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: type
+            description: Either "recurring" (subscription) or "one_time".
+          - name: recurring__interval
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: recurring__interval
+            description: Billing interval for recurring prices ("month" or "year"). Null for one_time prices.
+          - name: recurring__interval_count
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: recurring__interval_count
+            description: Number of intervals between billings (1 = every month/year). Null for one_time.
+          - name: product
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: product
+            description: FK to product.id — which product this price belongs to.
+          - name: active
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: active
+            description: Whether this price is available for new subscriptions.
+          - name: billing_scheme
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: billing_scheme
+            description: How the price is computed (e.g. "per_unit", "tiered").
+
+      - name: stripe_analytics.stripe_updated.subscription
+        source: stripe_analytics.stripe_updated.subscription
+        description: >
+          Stripe subscriptions linking customers to recurring plans.
+          The plan__* columns are denormalized copies of the associated price/plan and
+          can be used instead of joining to the price table for common billing fields.
+          Some subscriptions have null plan__* columns — use subscription__items__data
+          to find the full set of line items for those.
+        primary_key: [id]
+        unique_keys:
+          - [id]
+        fields:
+          - name: id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: id
+            description: Stripe subscription ID (prefix sub_).
+          - name: customer
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: customer
+            description: FK to customer.id.
+          - name: status
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: status
+            description: >
+              Subscription lifecycle status. Stripe values: "active", "trialing",
+              "past_due", "canceled", "unpaid", "incomplete", "incomplete_expired", "paused".
+          - name: plan__id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: plan__id
+            description: FK to price.id — the primary price on this subscription (denormalized). May be null for multi-item subscriptions.
+          - name: plan__amount
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: plan__amount
+            description: Recurring charge amount in CENTS (denormalized from price). May be null for multi-item subscriptions.
+          - name: plan__interval
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: plan__interval
+            description: Billing interval, e.g. "month" (denormalized from price).
+          - name: plan__product
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: plan__product
+            description: FK to product.id (denormalized from price).
+          - name: start_date
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: start_date
+            description: Unix timestamp when the subscription started.
+            dimension:
+              is_time: true
+          - name: current_period_start
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: current_period_start
+            description: Unix timestamp for the start of the current billing period.
+            dimension:
+              is_time: true
+          - name: current_period_end
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: current_period_end
+            description: Unix timestamp for the end of the current billing period (next renewal date).
+            dimension:
+              is_time: true
+          - name: cancel_at_period_end
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: cancel_at_period_end
+            description: If true, the subscription will cancel at the end of the current period rather than renewing.
+          - name: canceled_at
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: canceled_at
+            description: Unix timestamp when the subscription was canceled. Null if still active.
+            dimension:
+              is_time: true
+          - name: ended_at
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: ended_at
+            description: Unix timestamp when the subscription fully ended (period expired after cancellation).
+            dimension:
+              is_time: true
+          - name: cancellation_details__reason
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: cancellation_details__reason
+            description: >
+              Reason for cancellation. Stripe values: "cancellation_requested" (customer-initiated),
+              "payment_failed", "payment_disputed".
+          - name: latest_invoice
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: latest_invoice
+            description: FK to invoice.id — the most recent invoice for this subscription.
+
+      - name: stripe_analytics.stripe_updated.subscription__items__data
+        source: stripe_analytics.stripe_updated.subscription__items__data
+        description: >
+          Child table of subscription — each row is one line item (price) within a subscription.
+          Linked to parent subscription via: _dlt_parent_id = subscription._dlt_id.
+          Also has a direct subscription FK. Some subscriptions have multiple items
+          (e.g., base plan + add-on). Use this table to get accurate per-item pricing
+          for subscriptions where plan__* is null on the parent.
+        primary_key: [id]
+        fields:
+          - name: id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: id
+            description: Stripe subscription item ID (prefix si_).
+          - name: subscription
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: subscription
+            description: FK to subscription.id.
+          - name: price__id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: price__id
+            description: FK to price.id — the price for this line item.
+          - name: price__product
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: price__product
+            description: FK to product.id (denormalized from price).
+          - name: quantity
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: quantity
+            description: Number of units for this subscription item.
+          - name: _dlt_parent_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: _dlt_parent_id
+            description: dlt internal FK — joins to subscription._dlt_id to link to parent subscription row.
+
+      - name: stripe_analytics.stripe_updated.invoice
+        source: stripe_analytics.stripe_updated.invoice
+        description: Stripe invoices generated for subscriptions and one-off charges.
+        primary_key: [id]
+        unique_keys:
+          - [id]
+        fields:
+          - name: id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: id
+            description: Stripe invoice ID (prefix in_).
+          - name: subscription
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: subscription
+            description: FK to subscription.id. Null for non-subscription invoices.
+          - name: customer
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: customer
+            description: FK to customer.id.
+          - name: status
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: status
+            description: Invoice status. Stripe values include "draft", "open", "paid", "uncollectible", "void".
+          - name: amount_due
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: amount_due
+            description: Total amount owed on the invoice in CENTS.
+          - name: amount_paid
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: amount_paid
+            description: Total amount collected in CENTS.
+          - name: amount_remaining
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: amount_remaining
+            description: Unpaid balance in CENTS. Zero for fully paid invoices.
+          - name: billing_reason
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: billing_reason
+            description: >
+              Why the invoice was created. Values: "subscription_cycle" (renewal),
+              "subscription_create" (first invoice on new subscription), "manual".
+          - name: period_start
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: period_start
+            description: Unix timestamp for the start of the billing period this invoice covers.
+            dimension:
+              is_time: true
+          - name: period_end
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: period_end
+            description: Unix timestamp for the end of the billing period this invoice covers.
+            dimension:
+              is_time: true
+          - name: paid
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: paid
+            description: Boolean — true if invoice has been fully paid.
+          - name: attempt_count
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: attempt_count
+            description: Number of payment attempts made.
+
+      - name: stripe_analytics.stripe_updated.invoice__lines__data
+        source: stripe_analytics.stripe_updated.invoice__lines__data
+        description: >
+          Child table of invoice — individual line items within each invoice.
+          Linked to parent invoice via: _dlt_parent_id = invoice._dlt_id.
+          Also has a direct invoice FK. Contains price and plan details per line.
+        fields:
+          - name: id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: id
+            description: Stripe invoice line item ID.
+          - name: invoice
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: invoice
+            description: FK to invoice.id.
+          - name: subscription
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: subscription
+            description: FK to subscription.id for this line item.
+          - name: subscription_item
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: subscription_item
+            description: FK to subscription__items__data.id.
+          - name: amount
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: amount
+            description: Line item amount in CENTS.
+          - name: description
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: description
+            description: Human-readable description of the line item (e.g. "1 × Pro Plan (at $89.00 / month)").
+          - name: price__id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: price__id
+            description: FK to price.id (denormalized).
+          - name: price__product
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: price__product
+            description: FK to product.id (denormalized).
+          - name: price__recurring__interval
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: price__recurring__interval
+            description: Billing interval for this line ("month", "year", or null for one-time).
+          - name: period__start
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: period__start
+            description: Unix timestamp — start of the period this line item covers.
+            dimension:
+              is_time: true
+          - name: period__end
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: period__end
+            description: Unix timestamp — end of the period this line item covers.
+            dimension:
+              is_time: true
+          - name: proration
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: proration
+            description: True if this line is a prorated adjustment (plan change mid-period).
+          - name: _dlt_parent_id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: _dlt_parent_id
+            description: dlt internal FK — joins to invoice._dlt_id to link to parent invoice row.
+
+      - name: stripe_analytics.stripe_updated.balance_transaction
+        source: stripe_analytics.stripe_updated.balance_transaction
+        description: >
+          Stripe balance transactions — the ledger of all money movement into and out of
+          the Stripe balance. Includes charges, payouts to bank, refunds, and Stripe fee adjustments.
+          The "source" column is a Stripe object ID (charge, payout, refund, etc.)
+          that caused this transaction.
+        primary_key: [id]
+        unique_keys:
+          - [id]
+        fields:
+          - name: id
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: id
+            description: Stripe balance transaction ID (prefix txn_).
+          - name: amount
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: amount
+            description: Transaction amount in CENTS. Positive = funds added (charges), negative = funds removed (payouts, refunds).
+          - name: fee
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: fee
+            description: Stripe processing fee in CENTS (always non-negative).
+          - name: net
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: net
+            description: Net amount in CENTS after fees (amount - fee).
+          - name: currency
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: currency
+            description: Currency code (e.g. "usd").
+          - name: type
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: type
+            description: >
+              Transaction type. Values seen: "charge", "payout", "refund", "stripe_fee".
+          - name: reporting_category
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: reporting_category
+            description: Stripe reporting category matching "type" for these records (charge, payout, refund, fee).
+          - name: status
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: status
+            description: Transaction status. Stripe values include "available" and "pending".
+          - name: source
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: source
+            description: ID of the Stripe object that caused this transaction (e.g. charge ID ch_*, payout ID po_*, refund ID re_*).
+          - name: available_on
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: available_on
+            description: Unix timestamp when the funds become available in the Stripe balance.
+            dimension:
+              is_time: true
+          - name: created
+            expression:
+              dialects:
+                - dialect: ANSI_SQL
+                  expression: created
+            description: Unix timestamp when the transaction was created.
+            dimension:
+              is_time: true
+
+    relationships:
+      - name: subscription_to_customer
+        from: stripe_analytics.stripe_updated.subscription
+        to: stripe_analytics.stripe_updated.customer
+        from_columns: [customer]
+        to_columns: [id]
+
+      - name: subscription_item_to_subscription
+        from: stripe_analytics.stripe_updated.subscription__items__data
+        to: stripe_analytics.stripe_updated.subscription
+        from_columns: [subscription]
+        to_columns: [id]
+
+      - name: subscription_item_to_price
+        from: stripe_analytics.stripe_updated.subscription__items__data
+        to: stripe_analytics.stripe_updated.price
+        from_columns: [price__id]
+        to_columns: [id]
+
+      - name: invoice_to_subscription
+        from: stripe_analytics.stripe_updated.invoice
+        to: stripe_analytics.stripe_updated.subscription
+        from_columns: [subscription]
+        to_columns: [id]
+
+      - name: invoice_to_customer
+        from: stripe_analytics.stripe_updated.invoice
+        to: stripe_analytics.stripe_updated.customer
+        from_columns: [customer]
+        to_columns: [id]
+
+      - name: invoice_line_to_invoice
+        from: stripe_analytics.stripe_updated.invoice__lines__data
+        to: stripe_analytics.stripe_updated.invoice
+        from_columns: [invoice]
+        to_columns: [id]
+
+      - name: invoice_line_to_subscription
+        from: stripe_analytics.stripe_updated.invoice__lines__data
+        to: stripe_analytics.stripe_updated.subscription
+        from_columns: [subscription]
+        to_columns: [id]
+
+      - name: price_to_product
+        from: stripe_analytics.stripe_updated.price
+        to: stripe_analytics.stripe_updated.product
+        from_columns: [product]
+        to_columns: [id]
+
+      - name: product_default_price
+        from: stripe_analytics.stripe_updated.product
+        to: stripe_analytics.stripe_updated.price
+        from_columns: [default_price]
+        to_columns: [id]
+
+    metrics:
+      - name: mrr
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: "SUM(plan__amount) / 100.0"
+        description: >
+          Monthly Recurring Revenue in dollars from active subscriptions.
+          Sum plan__amount (cents) for status = 'active', divided by 100.
+        ai_context:
+          instructions: "Filter subscription to status = 'active' before applying. Result is in dollars."
+
+      - name: total_revenue_collected
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: "SUM(amount_paid) / 100.0"
+        description: >
+          Total revenue collected in dollars from paid invoices.
+          Sum amount_paid (cents) divided by 100.
+        ai_context:
+          instructions: "Apply to invoice table. Filter to paid = true for only fully paid invoices."
+
+      - name: gross_charge_volume
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: "SUM(amount) / 100.0"
+        description: >
+          Total gross charge volume in dollars from balance transactions.
+          Sum amount (cents) for type = 'charge', divided by 100.
+
+      - name: net_revenue
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: "SUM(net) / 100.0"
+        description: >
+          Net revenue in dollars after Stripe fees, from balance transactions.
+          Sum net (cents) for type = 'charge', divided by 100.
+
+      - name: stripe_fees_total
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: "SUM(fee) / 100.0"
+        description: >
+          Total Stripe processing fees in dollars.
+          Sum fee (cents) for type = 'charge', divided by 100.
+
+      - name: active_subscription_count
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: "COUNT(*)"
+        description: >
+          Number of currently active subscriptions.
+          Apply COUNT(*) to subscription filtered to status = 'active'.
+
+      - name: churn_rate
+        expression:
+          dialects:
+            - dialect: ANSI_SQL
+              expression: "COUNT(CASE WHEN status = 'canceled' THEN 1 END) * 1.0 / COUNT(*)"
+        description: >
+          Ratio of canceled subscriptions to total subscriptions (all-time churn rate).
