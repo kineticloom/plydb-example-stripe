@@ -1,5 +1,9 @@
 # Stripe AI Analytics Starter — AI-Powered Subscription Intelligence
 
+Accompanying [blog post](https://www.plydb.com/blog/plydb-example-stripe/).
+
+--
+
 Ask questions about your Stripe account in plain English — MRR, churn, at-risk
 subscribers, expansion opportunities — answered instantly by an AI agent with
 zero ETL, no SQL required.
